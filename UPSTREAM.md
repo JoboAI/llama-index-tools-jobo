@@ -18,6 +18,10 @@ What that means for the plan "open a PR so the package is listed on LlamaHub":
 - The workflow's closing comment says to comment on the PR "if you believe this was closed in error (e.g., you are modifying an existing package)". A new package is not that case. Asking a maintainer first (for example on the project's Discord, linked from `CONTRIBUTING.md`) is the honest way to find out whether an exception or another listing route exists.
 - The route CONTRIBUTING.md actually names is an independent package: its own repository, published to PyPI. Not confirmed from the files read: how, or whether, an independently published package gets listed on LlamaHub today. The `[tool.llamahub]` table in this `pyproject.toml` is kept because upstream's PR template asks for it.
 
+## How the package is released instead
+
+From its own public repository, `JoboAI/llama-index-tools-jobo`, which the monorepo's mirror workflow fills from this folder. `.github/workflows/release.yml` there publishes to PyPI with trusted publishing when a GitHub release `vX.Y.Z` is cut; the steps are in `Jobo.Connectors/RELEASING.md`, section 8. Bump the version in both `pyproject.toml` and `llama_index/tools/jobo/_client.py` (a unit test fails when they differ) and add it to `CHANGELOG.md`.
+
 ## Steps (if you attempt the in-repo PR anyway)
 
 1. Fork `https://github.com/run-llama/llama_index` on GitHub and clone your fork:

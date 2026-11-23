@@ -42,6 +42,8 @@ dependencies = [
 [project.urls]
 Homepage = "https://jobo.world"
 Documentation = "https://jobo.world/docs"
+Repository = "https://github.com/JoboAI/llama-index-tools-jobo"
+Changelog = "https://github.com/JoboAI/llama-index-tools-jobo/blob/main/CHANGELOG.md"
 
 [tool.codespell]
 check-filenames = true

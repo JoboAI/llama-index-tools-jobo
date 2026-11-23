@@ -1,0 +1,93 @@
+name: Release to PyPI
+
+# Runs in the PUBLIC mirror (github.com/JoboAI/llama-index-tools-jobo), where
+# this file lands via the monorepo's connectors-mirror workflow. It does nothing
+# in the monorepo, where it sits under Jobo.Connectors/llamaindex/.
+#
+# Cut a GitHub release (tag vX.Y.Z) in the mirror to publish. There is no token
+# or secret: the publish job authenticates with PyPI trusted publishing (OIDC).
+# One-time setup on PyPI, signed in as the account that owns the project
+# (https://pypi.org/manage/account/publishing/): add a publisher with
+#   project llama-index-tools-jobo · owner JoboAI · repository llama-index-tools-jobo
+#   workflow release.yml · environment pypi
+# Before the first upload that is a "pending publisher"; the first release
+# creates the project and claims the name.
+#
+# The package ships from its own repository because run-llama/llama_index closes
+# pull requests that add a new integration package (see UPSTREAM.md).
+on:
+  release:
+    types: [published]
+  # Rehearsal: installs, tests, builds and checks the distributions. Never publishes.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # The committed version is the source of truth, not the tag. A PyPI
+      # version can never be reused, so a mismatch stops here. The version is
+      # written twice, in pyproject.toml and in _client.py (it goes out in the
+      # User-Agent); a unit test keeps the two equal. Bump both in the monorepo,
+      # wait for the mirror sync, THEN cut the release.
+      - name: Check the release tag matches the package version
+        if: github.event_name == 'release'
+        run: |
+          set -euo pipefail
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          CURRENT="$(python -c "import tomllib, pathlib; print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])")"
+          if [ "$CURRENT" != "$TAG_VERSION" ]; then
+            echo "::error::tag v$TAG_VERSION does not match pyproject.toml ($CURRENT). Bump the version in the monorepo, wait for the mirror sync, then re-cut the release."
+            exit 1
+          fi
+          echo "llama-index-tools-jobo is at $TAG_VERSION"
+
+      # Not the dev dependency group: it is upstream's, and pulls in Jupyter and
+      # a dozen type-stub packages that nothing here uses.
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install . pytest
+
+      # The HTTP client is httpx with a mock transport; nothing reaches the API.
+      - name: Test
+        run: pytest
+
+      - name: Build and check the distributions
+        run: |
+          python -m pip install build twine
+          python -m build
+          twine check --strict dist/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    # Must match the environment named in the PyPI trusted publisher.
+    environment:
+      name: pypi
+      url: https://pypi.org/project/llama-index-tools-jobo/
+    permissions:
+      id-token: write # PyPI trusted publishing
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
