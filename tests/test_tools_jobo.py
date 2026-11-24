@@ -213,15 +213,24 @@ def test_search_request_shape_and_headers() -> None:
         companies=["FedEx, Inc."],
         exclude_companies="Acme Staffing",
         industries=["Software Development"],
+        exclude_industries="Staffing, Recruiting",
         job_categories=["Healthcare"],
+        exclude_job_categories=["Retail"],
+        job_subcategories="Nursing",
+        exclude_job_subcategories=["Midwifery"],
         occupation_ids="esco:1,esco:2",
+        exclude_occupation_ids="esco:3",
         sources="greenhouse",
         language="en",
         company_categories=["saas"],
+        exclude_company_categories="Agency",
         min_salary_usd=90000,
         max_salary_usd=150000,
         posted_after="2026-01-31",
         posted_before="2026-02-01T09:00:00+00:00",
+        discovered_after="2026-01-15",
+        discovered_before="2026-02-01T10:00:00+01:00",
+        search_description=False,
         sort="discovered_desc",
         page=2,
         page_size=3,
@@ -243,13 +252,20 @@ def test_search_request_shape_and_headers() -> None:
         "skills": {"include": ["Python", "Kubernetes"], "exclude": ["PHP"]},
         # A name is never split on commas.
         "companies": {"include": ["FedEx, Inc."], "exclude": ["Acme Staffing"]},
-        "industries": {"include": ["Software Development"]},
-        "company_categories": {"include": ["saas"]},
-        "job_categories": {"include": ["Healthcare"]},
-        "occupation_ids": {"include": ["esco:1", "esco:2"]},
+        "industries": {
+            "include": ["Software Development"],
+            "exclude": ["Staffing, Recruiting"],
+        },
+        "company_categories": {"include": ["saas"], "exclude": ["agency"]},
+        "job_categories": {"include": ["Healthcare"], "exclude": ["Retail"]},
+        "job_subcategories": {"include": ["Nursing"], "exclude": ["Midwifery"]},
+        "occupation_ids": {"include": ["esco:1", "esco:2"], "exclude": ["esco:3"]},
         "salary_usd": {"min": 90000, "max": 150000},
         "posted_after": "2026-01-31T00:00:00Z",
         "posted_before": "2026-02-01T09:00:00Z",
+        "discovered_after": "2026-01-15T00:00:00Z",
+        "discovered_before": "2026-02-01T10:00:00+01:00",
+        "search_description": False,
         "sort": "discovered_desc",
         "page": 2,
         "page_size": 3,
@@ -308,6 +324,10 @@ def test_page_size_is_capped_with_a_note() -> None:
         {"company_categories": ["bank"]},
         {"sort": "newest"},
         {"posted_after": "last week"},
+        {"exclude_company_categories": ["bank"]},
+        {"discovered_before": "yesterday"},
+        {"min_salary_usd": -1},
+        {"max_salary_usd": -50000},
     ],
 )
 def test_bad_filter_value_is_rejected_before_any_request(
@@ -317,6 +337,18 @@ def test_bad_filter_value_is_rejected_before_any_request(
     with pytest.raises(ValueError):
         tool.search_jobs(**kwargs)
     assert api.requests == []
+
+
+def test_salary_bounds_below_zero_are_rejected_and_zero_means_no_bound() -> None:
+    tool, api, _ = spec(search_ok)
+    with pytest.raises(ValueError, match="min_salary_usd must be 0 or greater"):
+        tool.search_jobs(min_salary_usd=-1)
+    with pytest.raises(ValueError, match="max_salary_usd must be 0 or greater"):
+        asyncio.run(tool.asearch_jobs(max_salary_usd=-1))
+    assert api.requests == []
+
+    tool.search_jobs(min_salary_usd=0, max_salary_usd=0)
+    assert "salary_usd" not in api.body
 
 
 # ------------------------------------------------------------------- get_job
@@ -589,11 +621,47 @@ def test_429_then_success_recovers() -> None:
     assert len(api.requests) == 2 and sleeps == [1.0]
 
 
-def test_5xx_and_400_mapping() -> None:
-    tool, api, _ = spec(reply(503, {"message": "down"}))
+def test_500_on_the_billed_search_is_not_replayed_but_on_a_lookup_it_is() -> None:
+    # Search takes its charge before it builds the answer: a replay bills twice.
+    tool, api, sleeps = spec(reply(500, {"message": "boom"}))
     with pytest.raises(JoboServerError):
         tool.search_jobs(query="x")
-    assert len(api.requests) == 3
+    assert len(api.requests) == 1 and sleeps == []
+    with pytest.raises(JoboServerError):
+        asyncio.run(tool.asearch_jobs(query="x"))
+    assert len(api.requests) == 2 and sleeps == []
+
+    tool, api, sleeps = spec(reply(500, {"message": "boom"}))
+    with pytest.raises(JoboServerError):
+        tool.get_job(JOB_ID)
+    assert len(api.requests) == 3 and len(sleeps) == 2
+
+
+def test_503_with_retry_after_is_retried_on_search() -> None:
+    busy = httpx.Response(503, json={"title": "down"}, headers={"Retry-After": "5"})
+    answers = iter([busy, search_ok(httpx.Request("POST", "https://x.example"))])
+    tool, api, sleeps = spec(lambda _r: next(answers))
+    assert len(tool.search_jobs(query="x")) == 2
+    assert len(api.requests) == 2 and sleeps == [5.0]
+
+
+@pytest.mark.parametrize(("name", "call"), CALLS, ids=[c[0] for c in CALLS])
+def test_503_without_retry_after_is_never_retried(
+    name: str, call: Callable[[JoboToolSpec], Any]
+) -> None:
+    # "Search took too long" sends none: the same request fails the same way.
+    tool, api, sleeps = spec(reply(503, {"title": "Search took too long"}))
+    with pytest.raises(JoboServerError) as caught:
+        call(tool)
+    assert caught.value.retry_after is None
+    assert len(api.requests) == 1 and sleeps == []
+
+
+def test_5xx_and_400_mapping() -> None:
+    tool, api, _ = spec(reply(502, {"message": "bad gateway"}))
+    with pytest.raises(JoboServerError):
+        tool.search_jobs(query="x")
+    assert len(api.requests) == 1
 
     problem = {
         "title": "One or more validation errors occurred.",
@@ -662,9 +730,108 @@ def test_async_search_and_lookups_use_the_same_requests() -> None:
     assert api.last.url.path == "/api/connectors/filter-options/skills"
 
 
+#: What the model reads from `search_ok`: the summary, then the job, as text.
+SEARCH_OK_TEXT = "\n".join(
+    [
+        "42 matching jobs; showing 1 (page 1 of 9). More results are available: "
+        "request page 2.",
+        "1. Senior Backend Engineer - Acme",
+        "   Location: Berlin, Germany | Work model: Remote | Employment: Full-time"
+        " | Level: Senior",
+        "   Salary: USD 90,000-120,000 per year",
+        "   Posted: 2026-11-01",
+        "   URL: https://jobs.example.com/1",
+        f"   ID: {JOB_ID}",
+    ]
+)
+
+
 def test_agent_tool_call_goes_through_the_function_tool() -> None:
+    """
+    The model gets each Document's text, not a dump of the Document objects.
+
+    llama-index-core 0.13.0 turned a returned list of Documents into
+    `str(list)`; 0.13.1 and later read each one's `get_content()`.
+    """
     tool, api, _ = spec(search_ok)
     search = {t.metadata.name: t for t in tool.to_tool_list()}["search_jobs"]
     output = search.call(query="python", page_size=1)
     assert api.body["queries"] == ["python"]
-    assert "Senior Backend Engineer" in str(output)
+    assert output.content == SEARCH_OK_TEXT
+    assert "Document(" not in output.content and "id_=" not in output.content
+
+    output = asyncio.run(search.acall(query="python", page_size=1))
+    assert output.content == SEARCH_OK_TEXT
+
+
+# ---------------------------------------------------------------- connections
+
+
+class CountingClients:
+    """Stands in for `httpx.Client` / `httpx.AsyncClient`, counting what is made."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.sync: List[httpx.Client] = []
+        self.asynchronous: List[httpx.AsyncClient] = []
+        real_sync, real_async = httpx.Client, httpx.AsyncClient
+
+        def make_sync() -> httpx.Client:
+            self.sync.append(real_sync(transport=httpx.MockTransport(search_ok)))
+            return self.sync[-1]
+
+        def make_async() -> httpx.AsyncClient:
+            client = real_async(transport=httpx.MockTransport(search_ok))
+            self.asynchronous.append(client)
+            return client
+
+        monkeypatch.setattr(httpx, "Client", make_sync)
+        monkeypatch.setattr(httpx, "AsyncClient", make_async)
+
+
+@pytest.fixture
+def made(monkeypatch: pytest.MonkeyPatch) -> CountingClients:
+    return CountingClients(monkeypatch)
+
+
+def test_sync_calls_reuse_one_connection_pool_until_closed(
+    made: CountingClients,
+) -> None:
+    tool = JoboToolSpec(api_key=KEY)
+    for _ in range(3):
+        tool.search_jobs(query="x")
+    assert len(made.sync) == 1 and not made.sync[0].is_closed
+
+    tool.close()
+    tool.close()  # closing twice is harmless
+    assert made.sync[0].is_closed
+    tool.search_jobs(query="x")  # and the tool spec opens a new pool
+    assert len(made.sync) == 2 and made.asynchronous == []
+
+
+def test_async_calls_reuse_one_pool_per_event_loop(made: CountingClients) -> None:
+    tool = JoboToolSpec(api_key=KEY)
+
+    async def two_calls_then_close() -> None:
+        await tool.asearch_jobs(query="x")
+        await tool.afind_locations("berlin")
+        await tool.aclose()
+
+    asyncio.run(two_calls_then_close())
+    assert len(made.asynchronous) == 1 and made.asynchronous[0].is_closed
+
+    # An `httpx.AsyncClient` cannot be shared between event loops, and the
+    # clients of loops that have closed are let go.
+    for _ in range(3):
+        asyncio.run(tool.asearch_jobs(query="x"))
+    assert len(made.asynchronous) == 4
+    assert len(tool._client._owned_async_clients) == 1
+    assert made.sync == []
+
+
+def test_clients_passed_in_are_never_closed() -> None:
+    tool, api, _ = spec(search_ok)
+    tool.search_jobs(query="x")
+    asyncio.run(tool.asearch_jobs(query="x"))
+    tool.close()
+    asyncio.run(tool.aclose())
+    assert not api.client.is_closed and not api.async_client.is_closed

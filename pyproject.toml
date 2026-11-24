@@ -26,7 +26,7 @@ dev = [
 
 [project]
 name = "llama-index-tools-jobo"
-version = "0.1.0"
+version = "0.2.0"
 description = "llama-index tools jobo integration: live job listings from employer career sites and ATS platforms"
 authors = [{name = "Jobo", email = "support@jobo.world"}]
 requires-python = ">=3.11,<4.0"
@@ -36,7 +36,7 @@ maintainers = [{name = "Jobo", email = "support@jobo.world"}]
 keywords = ["jobs", "job-search", "job-listings", "ats", "recruitment", "agents", "tools"]
 dependencies = [
     "httpx>=0.25.0,<1",
-    "llama-index-core>=0.13.0,<0.15",
+    "llama-index-core>=0.13.1,<0.15",
 ]
 
 [project.urls]
@@ -72,4 +72,4 @@ disallow_untyped_defs = true
 # Remove venv skip when integrated with pre-commit
 exclude = ["_static", "build", "examples", "notebooks", "venv"]
 ignore_missing_imports = true
-python_version = "3.8"
+python_version = "3.11"

@@ -179,9 +179,13 @@ class JoboToolSpec(BaseToolSpec):
             base_url: API base URL. Defaults to `https://connect.jobo.world`.
             timeout: Response timeout in seconds.
             max_retries: Retries for 429, 500 and 503 responses and failures
-                to connect. 402 and read timeouts are never retried.
-            http_client: Optional `httpx.Client` for sync requests.
-            http_async_client: Optional `httpx.AsyncClient` for async requests.
+                to connect. 402 and read timeouts are never retried, nor is a
+                503 without `Retry-After`. Search retries only 429 and a 503
+                with `Retry-After`: a 500 can come after search has billed.
+            http_client: Optional `httpx.Client` for sync requests. It is
+                never closed by the tool spec.
+            http_async_client: Optional `httpx.AsyncClient` for async
+                requests. It is never closed by the tool spec.
 
         """
         if not 1 <= max_page_size <= API_MAX_PAGE_SIZE:
@@ -201,6 +205,25 @@ class JoboToolSpec(BaseToolSpec):
 
     def __repr__(self) -> str:
         return f"JoboToolSpec(max_page_size={self.max_page_size})"
+
+    def close(self) -> None:
+        """
+        Close the HTTP connections this tool spec opened.
+
+        The tool spec keeps one connection pool and reuses it for every call.
+        An `http_client` you passed in is left open. The tool spec stays
+        usable: its next call opens a new pool.
+        """
+        self._client.close()
+
+    async def aclose(self) -> None:
+        """
+        Close the HTTP connections this tool spec opened, sync and async.
+
+        Clients you passed in are left open. Await it on the event loop the
+        tools ran on: each event loop gets a pool of its own.
+        """
+        await self._client.aclose()
 
     # ------------------------------------------------------------ search_jobs
 
@@ -247,28 +270,55 @@ class JoboToolSpec(BaseToolSpec):
             "companies": _pair(
                 _as_list(a["companies"], False), _as_list(a["exclude_companies"], False)
             ),
-            "industries": _pair(_as_list(a["industries"], False), []),
+            "industries": _pair(
+                _as_list(a["industries"], False),
+                _as_list(a["exclude_industries"], False),
+            ),
             "company_categories": _pair(
                 _enum_list(
                     "company_categories", a["company_categories"], COMPANY_CATEGORIES
                 ),
-                [],
+                _enum_list(
+                    "exclude_company_categories",
+                    a["exclude_company_categories"],
+                    COMPANY_CATEGORIES,
+                ),
             ),
-            "job_categories": _pair(_as_list(a["job_categories"], False), []),
-            "occupation_ids": _pair(_as_list(a["occupation_ids"], True), []),
+            "job_categories": _pair(
+                _as_list(a["job_categories"], False),
+                _as_list(a["exclude_job_categories"], False),
+            ),
+            "job_subcategories": _pair(
+                _as_list(a["job_subcategories"], False),
+                _as_list(a["exclude_job_subcategories"], False),
+            ),
+            "occupation_ids": _pair(
+                _as_list(a["occupation_ids"], True),
+                _as_list(a["exclude_occupation_ids"], True),
+            ),
         }
         body.update({k: v for k, v in pairs.items() if v})
         salary: Dict[str, int] = {}
-        if a["min_salary_usd"]:
-            salary["min"] = int(a["min_salary_usd"])
-        if a["max_salary_usd"]:
-            salary["max"] = int(a["max_salary_usd"])
+        for key, bound in (("min_salary_usd", "min"), ("max_salary_usd", "max")):
+            if a[key] is not None and int(a[key]) < 0:
+                raise ValueError(
+                    f"{key} must be 0 or greater (0 means no bound), got {a[key]}."
+                )
+            if a[key]:
+                salary[bound] = int(a[key])
         if salary:
             body["salary_usd"] = salary
-        for key in ("posted_after", "posted_before"):
+        for key in (
+            "posted_after",
+            "posted_before",
+            "discovered_after",
+            "discovered_before",
+        ):
             stamp = _timestamp(key, a[key])
             if stamp:
                 body[key] = stamp
+        if a["search_description"] is False:
+            body["search_description"] = False
         sort = (a["sort"] or "").strip().lower()
         if sort:
             if sort not in SORTS:
@@ -329,15 +379,24 @@ class JoboToolSpec(BaseToolSpec):
         companies: Optional[StrOrList] = None,
         exclude_companies: Optional[StrOrList] = None,
         industries: Optional[StrOrList] = None,
+        exclude_industries: Optional[StrOrList] = None,
         job_categories: Optional[StrOrList] = None,
+        exclude_job_categories: Optional[StrOrList] = None,
+        job_subcategories: Optional[StrOrList] = None,
+        exclude_job_subcategories: Optional[StrOrList] = None,
         occupation_ids: Optional[StrOrList] = None,
+        exclude_occupation_ids: Optional[StrOrList] = None,
         sources: Optional[StrOrList] = None,
         language: Optional[StrOrList] = None,
         company_categories: Optional[StrOrList] = None,
+        exclude_company_categories: Optional[StrOrList] = None,
         min_salary_usd: Optional[int] = None,
         max_salary_usd: Optional[int] = None,
         posted_after: Optional[str] = None,
         posted_before: Optional[str] = None,
+        discovered_after: Optional[str] = None,
+        discovered_before: Optional[str] = None,
+        search_description: Optional[bool] = None,
         sort: Optional[str] = None,
         page: int = 1,
         page_size: int = DEFAULT_PAGE_SIZE,
@@ -377,23 +436,37 @@ class JoboToolSpec(BaseToolSpec):
                 domains or whole names).
             industries: Industry names, exactly as find_filter_values lists
                 them (facet industries).
+            exclude_industries: Leave out companies in these industries.
             job_categories: Occupation category names such as "Healthcare"
                 (facet job_categories).
+            exclude_job_categories: Leave out these occupation categories.
+            job_subcategories: Occupation subcategory names such as "Nursing"
+                (facet job_subcategories).
+            exclude_job_subcategories: Leave out these subcategories.
             occupation_ids: Occupation ids, not names (facet occupations
                 with the occupation's name as the query).
+            exclude_occupation_ids: Leave out these occupation ids.
             sources: ATS provider ids such as greenhouse, lever, workday
                 (facet sources).
             language: Description languages as ISO 639-1 codes, e.g. en, de.
             company_categories: Hiring company's business model: b2b, b2c,
                 b2b2c, b2g, saas, marketplace, e-commerce, service-provider,
                 hardware, agency, nonprofit, government, education.
-            min_salary_usd: Minimum annual salary in USD. Jobs without
-                disclosed pay are excluded when a salary bound is set.
-            max_salary_usd: Maximum annual salary in USD.
+            exclude_company_categories: Leave out these business models,
+                e.g. agency.
+            min_salary_usd: Minimum annual salary in USD, 0 or more. Jobs
+                without disclosed pay are excluded when a salary bound is set.
+            max_salary_usd: Maximum annual salary in USD, 0 or more.
             posted_after: Only jobs posted on or after this ISO 8601 date or
                 timestamp.
             posted_before: Only jobs posted on or before this ISO 8601 date or
                 timestamp.
+            discovered_after: Only jobs Jobo first indexed on or after this
+                ISO 8601 date or timestamp.
+            discovered_before: Only jobs Jobo first indexed on or before this
+                ISO 8601 date or timestamp.
+            search_description: false matches the query against job titles
+                only; true (default) also against company, skills and summary.
             sort: relevance (default), discovered_asc or discovered_desc
                 (when Jobo first indexed the job).
             page: Page number, starting at 1.
@@ -417,15 +490,24 @@ class JoboToolSpec(BaseToolSpec):
         companies: Optional[StrOrList] = None,
         exclude_companies: Optional[StrOrList] = None,
         industries: Optional[StrOrList] = None,
+        exclude_industries: Optional[StrOrList] = None,
         job_categories: Optional[StrOrList] = None,
+        exclude_job_categories: Optional[StrOrList] = None,
+        job_subcategories: Optional[StrOrList] = None,
+        exclude_job_subcategories: Optional[StrOrList] = None,
         occupation_ids: Optional[StrOrList] = None,
+        exclude_occupation_ids: Optional[StrOrList] = None,
         sources: Optional[StrOrList] = None,
         language: Optional[StrOrList] = None,
         company_categories: Optional[StrOrList] = None,
+        exclude_company_categories: Optional[StrOrList] = None,
         min_salary_usd: Optional[int] = None,
         max_salary_usd: Optional[int] = None,
         posted_after: Optional[str] = None,
         posted_before: Optional[str] = None,
+        discovered_after: Optional[str] = None,
+        discovered_before: Optional[str] = None,
+        search_description: Optional[bool] = None,
         sort: Optional[str] = None,
         page: int = 1,
         page_size: int = DEFAULT_PAGE_SIZE,

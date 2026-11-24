@@ -4,15 +4,20 @@ Small sync and async HTTP client for the Jobo API.
 Internal. It owns the key, the headers and the retry and error rules:
 
 - headers: `X-Api-Key`, a `User-Agent` and `X-Jobo-Client: llamaindex`;
+- connections: one `httpx.Client` and one `httpx.AsyncClient` per event loop
+  are kept and reused, and closed by `close()` / `aclose()`;
 - retries: only 429, 500 and 503 and failures to connect are retried,
   `Retry-After` is honoured, and 402 is never retried. A read timeout is not
-  retried either, because a billed page may already have been delivered;
+  retried either, because a billed page may already have been delivered. A
+  503 without `Retry-After` is not retried, and neither is a 500 on the
+  billed search;
 - errors: every non-2xx response is raised as a typed `JoboAPIError`.
 """
 
 import asyncio
 import os
 import random
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Mapping, Optional
@@ -33,7 +38,7 @@ from llama_index.tools.jobo.errors import (
     field_errors,
 )
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 DEFAULT_BASE_URL = "https://connect.jobo.world"
 DEFAULT_TIMEOUT = 30.0
@@ -46,6 +51,12 @@ CLIENT_NAME = "llamaindex"
 USER_AGENT = f"llama-index-tools-jobo/{__version__}"
 
 _RETRYABLE_STATUSES = frozenset({429, 500, 503})
+#: `POST /api/jobs/search` bills every job it returns, every time, and takes
+#: the charge before it builds the response: a 500 can follow a charge, and a
+#: replay would charge again. Only a refusal that comes before any work is
+#: retried there.
+_BILLED_RETRYABLE_STATUSES = frozenset({429, 503})
+_BILLED_SEARCH_PATH = "/api/jobs/search"
 
 _ERROR_BY_STATUS: Dict[int, type] = {
     400: JoboValidationError,
@@ -132,6 +143,13 @@ class JoboClient:
         self.max_retries = max_retries
         self._http_client = http_client
         self._http_async_client = http_async_client
+        self._owned_client: Optional[httpx.Client] = None
+        self._owned_client_lock = threading.Lock()
+        # An `httpx.AsyncClient` belongs to the event loop it first ran on, so
+        # one is kept per loop, until that loop has closed.
+        self._owned_async_clients: Dict[
+            asyncio.AbstractEventLoop, httpx.AsyncClient
+        ] = {}
         self._sleep = time.sleep
         self._asleep = asyncio.sleep
 
@@ -188,10 +206,11 @@ class JoboClient:
     ) -> Reply:
         """Send a request and return the parsed JSON body and metering."""
         kwargs = self._kwargs(method, path, params, json)
+        billed = _is_billed(method, path)
         attempt = 0
         while True:
             try:
-                return self._attempt(kwargs)
+                return self._attempt(kwargs, billed)
             except _Attempt as failure:
                 delay = self._delay(failure, attempt)
                 if delay is None:
@@ -199,16 +218,32 @@ class JoboClient:
                 self._sleep(delay)
                 attempt += 1
 
-    def _attempt(self, kwargs: Dict[str, Any]) -> Reply:
+    def _attempt(self, kwargs: Dict[str, Any], billed: bool) -> Reply:
         try:
-            if self._http_client is not None:
-                response = self._http_client.request(**kwargs)
-            else:
-                with httpx.Client() as client:
-                    response = client.request(**kwargs)
+            response = self._sync_client().request(**kwargs)
         except httpx.TransportError as exc:
             raise _transport_failure(exc) from exc
-        return _handle(response)
+        return _handle(response, billed)
+
+    def _sync_client(self) -> httpx.Client:
+        if self._http_client is not None:
+            return self._http_client
+        with self._owned_client_lock:
+            if self._owned_client is None:
+                self._owned_client = httpx.Client()
+            return self._owned_client
+
+    def close(self) -> None:
+        """
+        Close the sync HTTP client this instance created, if it created one.
+
+        A client passed in as `http_client` is left open. The instance stays
+        usable: the next request opens a new client.
+        """
+        with self._owned_client_lock:
+            client, self._owned_client = self._owned_client, None
+        if client is not None:
+            client.close()
 
     async def arequest(
         self,
@@ -220,24 +255,51 @@ class JoboClient:
     ) -> Reply:
         """Async twin of `request`."""
         kwargs = self._kwargs(method, path, params, json)
+        billed = _is_billed(method, path)
+        client = self._async_client()
         attempt = 0
         while True:
             try:
                 try:
-                    if self._http_async_client is not None:
-                        response = await self._http_async_client.request(**kwargs)
-                    else:
-                        async with httpx.AsyncClient() as client:
-                            response = await client.request(**kwargs)
+                    response = await client.request(**kwargs)
                 except httpx.TransportError as exc:
                     raise _transport_failure(exc) from exc
-                return _handle(response)
+                return _handle(response, billed)
             except _Attempt as failure:
                 delay = self._delay(failure, attempt)
                 if delay is None:
                     raise failure.error from failure.__cause__
                 await self._asleep(delay)
                 attempt += 1
+
+    def _async_client(self) -> httpx.AsyncClient:
+        """The client for the running event loop, opened on first use."""
+        if self._http_async_client is not None:
+            return self._http_async_client
+        loop = asyncio.get_running_loop()
+        client = self._owned_async_clients.get(loop)
+        if client is None:
+            # A client whose loop has closed can neither be used nor awaited
+            # shut: let go of it, so repeated `asyncio.run()` calls do not
+            # pile up one dead client each.
+            for closed in [o for o in self._owned_async_clients if o.is_closed()]:
+                del self._owned_async_clients[closed]
+            client = httpx.AsyncClient()
+            self._owned_async_clients[loop] = client
+        return client
+
+    async def aclose(self) -> None:
+        """
+        Close the HTTP clients this instance created.
+
+        Closes the async client of the running event loop and the sync client.
+        Clients passed in as `http_client` / `http_async_client` are left
+        open. The instance stays usable: the next request opens a new client.
+        """
+        client = self._owned_async_clients.pop(asyncio.get_running_loop(), None)
+        if client is not None:
+            await client.aclose()
+        self.close()
 
 
 def _transport_failure(exc: httpx.TransportError) -> _Attempt:
@@ -249,7 +311,22 @@ def _transport_failure(exc: httpx.TransportError) -> _Attempt:
     return _Attempt(error, retryable)
 
 
-def _handle(response: httpx.Response) -> Reply:
+def _is_billed(method: str, path: str) -> bool:
+    """Whether the request is a search, which bills every job it returns."""
+    return method.upper() == "POST" and path == _BILLED_SEARCH_PATH
+
+
+def _is_retryable(error: JoboAPIError, billed: bool) -> bool:
+    status = error.status_code
+    if status not in (_BILLED_RETRYABLE_STATUSES if billed else _RETRYABLE_STATUSES):
+        return False
+    # The API sends `Retry-After` with a 503 it expects to pass ("unavailable").
+    # A 503 without it, such as "Search took too long", fails the same way
+    # again, and each replay holds a search thread on the server.
+    return status != 503 or error.retry_after is not None
+
+
+def _handle(response: httpx.Response, billed: bool) -> Reply:
     if response.is_success:
         try:
             return Reply(response.json(), _usage(response.headers))
@@ -259,9 +336,8 @@ def _handle(response: httpx.Response) -> Reply:
                 "that is not valid JSON."
             )
             raise _Attempt(error, False) from exc
-    raise _Attempt(
-        _error_from_response(response), response.status_code in _RETRYABLE_STATUSES
-    )
+    api_error = _error_from_response(response)
+    raise _Attempt(api_error, _is_retryable(api_error, billed))
 
 
 def _to_seconds(value: Any) -> Optional[float]:
