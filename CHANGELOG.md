@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.3.0
+
+### Added
+
+- **`get_hiring_signals`** and `aget_hiring_signals`: hiring signals over `GET /api/signals` and
+  `GET /api/companies/{id}/signals`. A signal is one event at one company, detected from its job postings:
+  a hiring surge, a first job in a country, a leadership search, a new technology, a slowdown.
+  - Arguments: `types`, `domains`, `company_id`, `countries`, `company_sizes`, `industries`,
+    `funding_stages`, `functions`, `roles`, `seniority`, `technologies`, `skills`, `job_countries`,
+    `min_strength`, `detected_after`, `detected_before`, `created_after`, `exclude_agencies`, `limit` and
+    `cursor`. With `company_id` the per-company endpoint is used, and a filter it does not take is refused
+    with a message that names it.
+  - Lists are sent comma-separated. A value that contains a comma, or a list of more than 100 values, is
+    refused with `ValueError` before the request.
+  - `limit` defaults to 5 and is capped at `max_signals` (default 25, at most 200). One call is one request:
+    the answer gives the model the cursor of the next page.
+  - Returns a summary document, one document per signal (company and domain, type, the dashboard's
+    one-line summary, detection day, strength as a band and a number, evidence job ids) and a last document
+    with what the call was billed. A type added to the API later is named, never an error.
+  - A `402`, `403`, `429` or `400` comes with what the model can do about it. A sandbox key gets a message
+    telling the model to stop, not an error.
+- **`JoboToolSpec(include_hiring_signals=True, max_signals=...)`** adds the tool to that spec's
+  `to_tool_list()`. It is off by default: every signal returned is billed at ten times the price of a job,
+  and a signal read again is billed again.
+- A contract drift test checks the signal types, the seniority levels, the labels, the page limits, the
+  filters and the tool's arguments against the shared signals contract, and records the filters the tool
+  leaves out on purpose.
+
+### Changed
+
+- **Hiring signals are not replayed after a `500`, a read timeout or a dropped connection**, like
+  `search_jobs`: both take their charge before they build the response. Only `429` and a `503` with
+  `Retry-After` are retried on them.
+
 ## 0.2.0
 
 ### Added

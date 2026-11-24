@@ -9,14 +9,15 @@ Internal. It owns the key, the headers and the retry and error rules:
 - retries: only 429, 500 and 503 and failures to connect are retried,
   `Retry-After` is honoured, and 402 is never retried. A read timeout is not
   retried either, because a billed page may already have been delivered. A
-  503 without `Retry-After` is not retried, and neither is a 500 on the
-  billed search;
+  503 without `Retry-After` is not retried, and neither is a 500 on a billed
+  read (search and hiring signals);
 - errors: every non-2xx response is raised as a typed `JoboAPIError`.
 """
 
 import asyncio
 import os
 import random
+import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -38,7 +39,7 @@ from llama_index.tools.jobo.errors import (
     field_errors,
 )
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 DEFAULT_BASE_URL = "https://connect.jobo.world"
 DEFAULT_TIMEOUT = 30.0
@@ -51,12 +52,14 @@ CLIENT_NAME = "llamaindex"
 USER_AGENT = f"llama-index-tools-jobo/{__version__}"
 
 _RETRYABLE_STATUSES = frozenset({429, 500, 503})
-#: `POST /api/jobs/search` bills every job it returns, every time, and takes
-#: the charge before it builds the response: a 500 can follow a charge, and a
-#: replay would charge again. Only a refusal that comes before any work is
-#: retried there.
+#: `POST /api/jobs/search` bills every job it returns, and the hiring signals
+#: reads every signal, every time. Both take the charge before they build the
+#: response: a 500 can follow a charge, and a replay would charge again. Only
+#: a refusal that comes before any work is retried there.
 _BILLED_RETRYABLE_STATUSES = frozenset({429, 503})
 _BILLED_SEARCH_PATH = "/api/jobs/search"
+#: `GET /api/signals` and `GET /api/companies/{id}/signals`.
+_BILLED_SIGNALS_PATH = re.compile(r"/api/signals|/api/companies/[^/]+/signals")
 
 _ERROR_BY_STATUS: Dict[int, type] = {
     400: JoboValidationError,
@@ -312,8 +315,11 @@ def _transport_failure(exc: httpx.TransportError) -> _Attempt:
 
 
 def _is_billed(method: str, path: str) -> bool:
-    """Whether the request is a search, which bills every job it returns."""
-    return method.upper() == "POST" and path == _BILLED_SEARCH_PATH
+    """Whether the request bills what it returns: a search, or hiring signals."""
+    verb = method.upper()
+    if verb == "POST":
+        return path == _BILLED_SEARCH_PATH
+    return verb == "GET" and _BILLED_SIGNALS_PATH.fullmatch(path) is not None
 
 
 def _is_retryable(error: JoboAPIError, billed: bool) -> bool:

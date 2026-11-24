@@ -1,6 +1,6 @@
 # LlamaIndex Tools Integration: Jobo
 
-[Jobo](https://jobo.world) is a jobs-data API: live job listings collected directly from employer career sites and applicant tracking systems (ATS). This package gives LlamaIndex agents tools to search those listings, read one in full, and look up the companies, filter values and locations a search needs.
+[Jobo](https://jobo.world) is a jobs-data API: live job listings collected directly from employer career sites and applicant tracking systems (ATS). This package gives LlamaIndex agents tools to search those listings, read one in full, and look up the companies, filter values and locations a search needs. On request it adds a tool that reads hiring signals: events at companies, detected from their job postings.
 
 - Maintainer: Jobo (`support@jobo.world`)
 - Homepage: <https://jobo.world>
@@ -83,8 +83,9 @@ print(documents[1].text)  # the first job: id, title, company, URL, ...
 | `find_companies` | Company name or domain to company ids | `GET /api/connectors/companies/suggest` | Free |
 | `find_filter_values` | Values a filter accepts (sources, industries, skills, company categories, job categories, job subcategories, occupations), with live job counts | `GET /api/connectors/filter-options/{facet}`, `GET /api/occupations` | Free |
 | `find_locations` | A place name to the locations `search_jobs` takes | `GET /api/connectors/locations/suggest` | Free |
+| `get_hiring_signals` | Hiring signals: a hiring surge, a first job in a country, a leadership search, a new technology, a slowdown. Only with `include_hiring_signals=True` | `GET /api/signals`, `GET /api/companies/{id}/signals` | Per signal returned, at ten times a job |
 
-Each function also has an async twin (`asearch_jobs`, `aget_job`, `afind_companies`, `afind_filter_values`, `afind_locations`), which `to_tool_list()` registers as the tool's async function.
+Each function also has an async twin (`asearch_jobs`, `aget_job`, `afind_companies`, `afind_filter_values`, `afind_locations`, `aget_hiring_signals`), which `to_tool_list()` registers as the tool's async function.
 
 Every function returns `List[Document]`. `search_jobs` returns a first document with `metadata["type"] == "search_summary"` (total matches, page, warnings, and the credits the API reported for the call), then one `type == "job"` document per job whose `doc_id` is the Jobo job id. `get_job` returns one job document. The lookups return one document of text. Called as a tool, each document reaches the model as its text: `llama-index-core` 0.13.1 and later turn a returned `Document` into its content, which is why that is the lowest version this package accepts.
 
@@ -102,6 +103,46 @@ Every function returns `List[Document]`. `search_jobs` returns a first document 
 - `description_format` from the API is not an argument: search results carry no description. `get_job` returns the full posting.
 - `page_size` defaults to 5 and never exceeds `max_page_size` (default 25, at most 100, the API's own limit). A larger request is reduced to the cap, with a note in the summary document.
 
+### Hiring signals
+
+A hiring signal is one event at one company, detected from its job postings: a hiring surge, a first job in a new country or function, a leadership search, a new technology, a slowdown or a hiring freeze. `get_hiring_signals` is the tool for a sales, recruiting or investor research agent: "which fintechs in Germany started hiring a sales team this month?", "is acme.com growing or freezing?". See the [hiring signals guide](https://jobo.world/docs/guides/hiring-signals) for the types and filters.
+
+Every signal it returns is billed at ten times the price of a job, and a signal read again is billed again, so the tool is not in the default tool list. Build the tool spec with `include_hiring_signals=True` to add it:
+
+```python
+from llama_index.tools.jobo import JoboToolSpec
+
+tool_spec = JoboToolSpec(include_hiring_signals=True, max_signals=10)
+tools = tool_spec.to_tool_list()  # the five job tools, then get_hiring_signals
+```
+
+The flag adds the sync and async pair to that tool spec's own `spec_functions`, so `to_tool_list()` and every other `BaseToolSpec` helper see it with its async twin, and the class's default list stays as it is.
+
+```python
+documents = tool_spec.get_hiring_signals(
+    types=["function_surge", "new_function"],
+    functions=["Sales"],
+    countries=["DE"],
+    industries=["Financial Services"],
+    detected_after="2026-11-01",
+)
+print(documents[0].text)  # how many signals, and the cursor of the next page
+print(documents[1].text)  # the first signal
+print(documents[-1].text)  # what the call was billed
+```
+
+Arguments: `types`, `domains`, `company_id`, `countries`, `company_sizes`, `industries`, `funding_stages`, `functions`, `roles`, `seniority`, `technologies`, `skills`, `job_countries`, `min_strength`, `detected_after`, `detected_before`, `created_after`, `exclude_agencies`, `limit` and `cursor`.
+
+- Filters combine with AND; the values of one list match any of them. `types`, `seniority` and `company_sizes` are closed sets: an unknown value raises `ValueError` before any request.
+- **A value cannot contain a comma.** The API separates list values with commas, so a value with one raises `ValueError` before the request instead of being read as two. A single string is split on commas for codes (`domains`, `countries`, `technologies`, `skills`, ...) and kept whole for names (`industries`, `funding_stages`, `functions`, `roles`). A list takes at most 100 values.
+- **`company_id`** reads one company from `GET /api/companies/{id}/signals`, which takes only `types`, `min_strength`, `detected_after`, `detected_before` and `created_after`. Any other filter beside it raises `ValueError` naming it, because that endpoint would ignore it. To name companies by website, use `domains`.
+- **`limit`** defaults to 5 and never exceeds `max_signals` (default 25, at most 200, the API's own limit). A larger request is reduced to the cap, with a note in the summary document.
+- **One call is one request.** The tool never pages on its own: the summary document gives the cursor of the next page.
+
+The summary document (`metadata["type"] == "signals_summary"`) has the number of signals, `has_more`, `next_cursor` and the credits the API reported. Each `type == "hiring_signal"` document, whose `doc_id` is the signal id, has the company and domain, the type, the one-line summary Jobo's dashboard shows, the detection day, the strength (1 to 100, comparable within one type) as a band and a number, and the ids of up to five jobs behind it, which `get_job` reads for free. The last document (`type == "signals_billing"`) says what the call was billed, from the response's metering headers. A type added to the API after this release is shown by its name, never an error.
+
+The other filters of the API (`exclude_domains`, `categories`, `founded_after`, `technology_categories`, `job_regions`, `job_cities`, `min_new_jobs`, `min_days_open`, `reposted_only`) are not arguments of the tool. Hiring signals need a live account API key.
+
 ## Billing
 
 Jobo bills per job, not per request. These notes follow the [billing docs](https://jobo.world/docs/billing), which are the source of truth.
@@ -111,19 +152,22 @@ Jobo bills per job, not per request. These notes follow the [billing docs](https
 - Before a billed request runs, the API checks that included jobs plus the wallet cover a full page (`page_size`) and answers `402` if they do not. A smaller `page_size` needs less cover.
 - `get_job`, `find_companies`, `find_filter_values` and `find_locations` are free. They still count toward rate limits.
 - `find_locations` uses the free connector typeahead. It is not the metered `GET /api/locations/geocode` endpoint, which this package does not call.
+- **Hiring signals bill every signal a response returns**, at ten times the price of a job, and a signal read again is billed again. A plan's included signals are used first, then the wallet; the Unlimited plan has no per-signal charge. A request that returns no signals is free. See the [hiring signals guide](https://jobo.world/docs/guides/hiring-signals#pricing).
 
-What this package does about it: the agent asks for 5 jobs by default, every call is capped at `max_page_size`, a `402` is never retried, and neither is a read timeout or a `500` on search (a billed page may already have been delivered). An agent that searches in a loop pays for every job each call returns, so keep `max_page_size` low and tell the agent when to stop searching.
+What this package does about it: the agent asks for 5 jobs by default, every call is capped at `max_page_size`, a `402` is never retried, and neither is a read timeout or a `500` on search or hiring signals (a billed page may already have been delivered). The hiring signals tool is only listed with `include_hiring_signals=True`, asks for 5 signals by default, is capped at `max_signals`, and ends every answer with what the call was billed. An agent that searches in a loop pays for every job each call returns, so keep `max_page_size` low and tell the agent when to stop searching.
 
 ### Sandbox keys
 
-A sandbox key (`jbe_test_...`) is free and returns fictional jobs in the real response shape. The sandbox serves job search and job lookups only. With a sandbox key, `find_companies`, `find_filter_values` and `find_locations` do not raise: they return a message telling the agent the lookup is unavailable and what to do instead. See the [sandbox docs](https://jobo.world/docs/sandbox).
+A sandbox key (`jbe_test_...`) is free and returns fictional jobs in the real response shape. The sandbox serves job search and job lookups only. With a sandbox key, `find_companies`, `find_filter_values` and `find_locations` do not raise: they return a message telling the agent the lookup is unavailable and what to do instead. `get_hiring_signals` does the same: it tells the agent that hiring signals need a live key and not to call it again. See the [sandbox docs](https://jobo.world/docs/sandbox).
 
 ## Errors and retries
 
 Requests that fail with `429`, `500` or `503`, or that cannot connect, are retried up to `max_retries` times (default 2). `Retry-After` is honoured; a wait longer than 60 seconds is not slept through, and the error is raised with `retry_after` set. `402` is never retried. Neither are:
 
 - a `503` without `Retry-After`. The API sends one when a search ran out of time ("Search took too long"), which fails the same way again;
-- a `500` on `search_jobs`. Search takes its charge before it builds the response, so a `500` can follow a charge and a replay would bill the jobs again. `search_jobs` retries only `429` and a `503` with `Retry-After`, which come before any work.
+- a `500` on `search_jobs` or `get_hiring_signals`. Both take their charge before they build the response, so a `500` can follow a charge and a replay would bill again. They retry only `429` and a `503` with `Retry-After`, which come before any work.
+
+`get_hiring_signals` adds what the agent can do to the message of a `402` (ask for a smaller `limit`), a `403` (stop: `account_key_required` means the key belongs to no account), a `429` (wait) and a `400` (correct the arguments).
 
 Errors are raised as typed exceptions, importable from `llama_index.tools.jobo`, all deriving from `JoboError`:
 

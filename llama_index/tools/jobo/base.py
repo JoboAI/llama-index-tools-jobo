@@ -31,11 +31,35 @@ from llama_index.tools.jobo._format import (
     search_header,
     search_notes,
 )
+from llama_index.tools.jobo._signals import (
+    COMPANY_SIZES,
+    NO_SIGNALS_IN_SANDBOX,
+    SIGNAL_MAX_LIMIT,
+    SIGNAL_SENIORITY,
+    SIGNAL_TYPES,
+    build_signals_request,
+    check_day,
+    check_enum,
+    check_instant,
+    format_signal,
+    next_cursor,
+    signal_list,
+    signal_metadata,
+    signals_error_advice,
+    signals_footer,
+    signals_header,
+)
 from llama_index.tools.jobo.errors import JoboAPIError, JoboNotFoundError
 
 API_MAX_PAGE_SIZE = 100
 DEFAULT_PAGE_SIZE = 5
 DEFAULT_MAX_PAGE_SIZE = 25
+#: Signals `get_hiring_signals` asks for when the model names no limit.
+DEFAULT_SIGNAL_LIMIT = 5
+DEFAULT_MAX_SIGNALS = 25
+#: The billed hiring signals tool, sync and async. Not in `spec_functions`:
+#: `JoboToolSpec(include_hiring_signals=True)` adds it.
+SIGNALS_SPEC_FUNCTION = ("get_hiring_signals", "aget_hiring_signals")
 _TAXONOMY_TTL_SECONDS = 600.0
 
 WORK_MODELS = ("remote", "hybrid", "onsite")
@@ -146,6 +170,10 @@ class JoboToolSpec(BaseToolSpec):
 
     Search is billed per job returned. Looking up one job, companies, filter
     values and locations is free, though every call counts toward rate limits.
+
+    Hiring signals (`get_hiring_signals`) are billed per signal, at ten times
+    the price of a job, so that tool is only in the tool list when the spec is
+    built with `include_hiring_signals=True`.
     """
 
     spec_functions = [
@@ -165,6 +193,8 @@ class JoboToolSpec(BaseToolSpec):
         max_retries: int = DEFAULT_MAX_RETRIES,
         http_client: Optional[httpx.Client] = None,
         http_async_client: Optional[httpx.AsyncClient] = None,
+        include_hiring_signals: bool = False,
+        max_signals: int = DEFAULT_MAX_SIGNALS,
     ) -> None:
         """
         Initialize with parameters.
@@ -186,13 +216,26 @@ class JoboToolSpec(BaseToolSpec):
                 never closed by the tool spec.
             http_async_client: Optional `httpx.AsyncClient` for async
                 requests. It is never closed by the tool spec.
+            include_hiring_signals: Add `get_hiring_signals` to this spec's
+                tools. Off by default: every signal it returns is billed at
+                ten times the price of a job, and a signal read again is
+                billed again. Hiring signals need a live account key.
+            max_signals: Hard cap on signals requested per
+                `get_hiring_signals` call (1-200, default 25). A larger
+                `limit` from the model is reduced to it.
 
         """
         if not 1 <= max_page_size <= API_MAX_PAGE_SIZE:
             raise ValueError(
                 f"max_page_size must be between 1 and {API_MAX_PAGE_SIZE}."
             )
+        if not 1 <= max_signals <= SIGNAL_MAX_LIMIT:
+            raise ValueError(f"max_signals must be between 1 and {SIGNAL_MAX_LIMIT}.")
         self.max_page_size = max_page_size
+        self.max_signals = max_signals
+        if include_hiring_signals:
+            # This instance only: the class keeps the job tools and free lookups.
+            self.spec_functions = [*type(self).spec_functions, SIGNALS_SPEC_FUNCTION]
         self._client = JoboClient(
             api_key,
             base_url=base_url,
@@ -829,6 +872,217 @@ class JoboToolSpec(BaseToolSpec):
         except JoboAPIError as error:
             return self._location_unavailable(error)
         return self._location_documents(str(params["q"]), reply)
+
+    # ----------------------------------------------------- get_hiring_signals
+
+    def _signals_request(self, **a: Any) -> Tuple[str, Dict[str, Any], Optional[int]]:
+        filters: Dict[str, Any] = {}
+        for key, allowed in (
+            ("types", SIGNAL_TYPES),
+            ("company_sizes", COMPANY_SIZES),
+            ("seniority", SIGNAL_SENIORITY),
+        ):
+            filters[key] = check_enum(key, _as_list(a[key], True), allowed)
+        for key in ("domains", "countries", "technologies", "skills", "job_countries"):
+            filters[key] = _as_list(a[key], True)
+        # A name is one value: a comma in it is refused, never split.
+        for key in ("industries", "funding_stages", "functions", "roles"):
+            filters[key] = _as_list(a[key], False)
+        for key in ("detected_after", "detected_before"):
+            filters[key] = check_day(key, a[key])
+        filters["created_after"] = check_instant("created_after", a["created_after"])
+        strength = a["min_strength"]
+        if strength is not None and not 1 <= int(strength) <= 100:
+            raise ValueError(f"min_strength must be 1-100, got {strength}.")
+        filters["min_strength"] = None if strength is None else int(strength)
+        filters["exclude_agencies"] = a["exclude_agencies"] is True
+        requested = max(int(a["limit"]), 1)
+        limit = min(requested, self.max_signals)
+        path, params = build_signals_request(
+            filters, company_id=a["company_id"], limit=limit, cursor=a["cursor"]
+        )
+        return path, params, (limit if limit < requested else None)
+
+    @staticmethod
+    def _signals_documents(reply: Reply, capped: Optional[int]) -> List[Document]:
+        payload = reply.data if isinstance(reply.data, dict) else {}
+        signals = signal_list(payload)
+        cursor = next_cursor(payload)
+        lines = [signals_header(len(signals), cursor)]
+        if capped is not None:
+            lines.append(
+                f"Note: limit was capped at {capped}, this tool's configured maximum."
+            )
+        summary: Dict[str, Any] = {
+            "type": "signals_summary",
+            "signals": len(signals),
+            "has_more": cursor is not None,
+            "next_cursor": cursor,
+            **reply.usage,
+        }
+        documents = [
+            Document(
+                text="\n".join(lines),
+                metadata={k: v for k, v in summary.items() if v is not None},
+            )
+        ]
+        for index, signal in enumerate(signals, start=1):
+            documents.append(
+                Document(
+                    doc_id=str(signal.get("id") or "") or None,
+                    text=format_signal(signal, index),
+                    metadata={"type": "hiring_signal", **signal_metadata(signal)},
+                )
+            )
+        documents.append(
+            Document(
+                text=signals_footer(signals, reply.usage, "get_job"),
+                metadata={
+                    "type": "signals_billing",
+                    "billed_signals": len(signals),
+                    **reply.usage,
+                },
+            )
+        )
+        return documents
+
+    @staticmethod
+    def _signals_failure(error: JoboAPIError) -> List[Document]:
+        if isinstance(error, JoboNotFoundError) and error.not_available_in_sandbox:
+            return _message(NO_SIGNALS_IN_SANDBOX, "signals_unavailable")
+        advice = signals_error_advice(error)
+        if advice:
+            error.args = (f"{error}\n{advice}",)
+        raise error
+
+    def get_hiring_signals(
+        self,
+        types: Optional[StrOrList] = None,
+        domains: Optional[StrOrList] = None,
+        company_id: Optional[str] = None,
+        countries: Optional[StrOrList] = None,
+        company_sizes: Optional[StrOrList] = None,
+        industries: Optional[StrOrList] = None,
+        funding_stages: Optional[StrOrList] = None,
+        functions: Optional[StrOrList] = None,
+        roles: Optional[StrOrList] = None,
+        seniority: Optional[StrOrList] = None,
+        technologies: Optional[StrOrList] = None,
+        skills: Optional[StrOrList] = None,
+        job_countries: Optional[StrOrList] = None,
+        min_strength: Optional[int] = None,
+        detected_after: Optional[str] = None,
+        detected_before: Optional[str] = None,
+        created_after: Optional[str] = None,
+        exclude_agencies: Optional[bool] = None,
+        limit: int = DEFAULT_SIGNAL_LIMIT,
+        cursor: Optional[str] = None,
+    ) -> List[Document]:
+        """
+        Read hiring signals. BILLED per signal returned, at ten times a job's price.
+
+        A hiring signal is one event at one company, detected from its job
+        postings: a hiring surge, a first job in a new country or function, a
+        leadership search, a new technology, a slowdown or a hiring freeze. Use
+        it to find companies that are growing, entering a market or building a
+        team, or to check whether one company is hiring or freezing.
+
+        Every signal returned is billed at ten times the price of a job, and a
+        signal read again is billed again: keep limit small and do not repeat
+        a call you already have the answer to. A call that returns no signals
+        costs nothing. Filters combine with AND; several values inside one
+        filter combine with OR. A value cannot contain a comma.
+
+        Returns a summary (how many signals, and the cursor of the next page),
+        one entry per signal with its company and domain, type, a one-line
+        summary, the day it was detected, its strength and the ids of the jobs
+        behind it (read them free with get_job), and a last line saying what
+        was billed.
+
+        Args:
+            types: Only these kinds of signal: hiring_surge, new_function,
+                new_country, leadership_hire, new_skill, hiring_slowdown,
+                first_role, new_technology, function_surge, new_city,
+                hard_to_fill, leadership_role_closed, hiring_freeze,
+                hiring_resumed. Leave empty for every kind.
+            domains: Only signals at these companies, by website domain, e.g.
+                "stripe.com". At most 100.
+            company_id: One company's signals, by Jobo company id (a UUID): the
+                Company ID shown with each signal. It takes only types,
+                min_strength, detected_after, detected_before, created_after,
+                limit and cursor. To name companies by website, use domains.
+            countries: Countries the companies are headquartered in, as
+                two-letter codes, e.g. "US", "DE".
+            company_sizes: Headcount bands of the companies: 1-10, 11-50,
+                51-200, 201-500, 501-1000, 1001-5000, 5001-10000, 10001+.
+            industries: Industries of the companies, matched against the
+                primary industry and the industry list.
+            funding_stages: Latest funding round of the companies, e.g. "Seed",
+                "Series A".
+            functions: Job categories the signal must be about, e.g.
+                "Technology", "Sales". A focus filter.
+            roles: Words or phrases to look for in the job title or occupation
+                behind the signal, e.g. "data engineer". At least 2 characters
+                each. A focus filter.
+            seniority: Seniority of the role behind the signal: junior, mid,
+                senior, director, vp, c_level, executive. A focus filter.
+            technologies: Named tools the signal must be about, e.g.
+                "Snowflake". A focus filter, combined with skills.
+            skills: Named skills the signal must be about. A focus filter,
+                combined with technologies.
+            job_countries: Countries the jobs are in (not the company's
+                headquarters), as two-letter codes. A focus filter.
+            min_strength: Only signals at least this strong, 1-100. Strength
+                compares signals of the same type.
+            detected_after: Earliest detection day, inclusive, as yyyy-MM-dd.
+            detected_before: Latest detection day, inclusive, as yyyy-MM-dd.
+            created_after: Only signals first stored after this instant,
+                exclusive, e.g. 2026-11-12T09:30:00Z.
+            exclude_agencies: Leave out staffing agencies, whose postings are
+                their clients' hiring.
+            limit: Signals to return (default 5). Every returned signal is
+                billed. Reduced to this tool's configured maximum if larger.
+            cursor: The cursor a previous answer gave, to read its next page.
+                Pass the same other arguments with it.
+
+        """
+        path, params, capped = self._signals_request(**self._args(locals()))
+        try:
+            reply = self._client.request("GET", path, params=params)
+        except JoboAPIError as error:
+            return self._signals_failure(error)
+        return self._signals_documents(reply, capped)
+
+    async def aget_hiring_signals(
+        self,
+        types: Optional[StrOrList] = None,
+        domains: Optional[StrOrList] = None,
+        company_id: Optional[str] = None,
+        countries: Optional[StrOrList] = None,
+        company_sizes: Optional[StrOrList] = None,
+        industries: Optional[StrOrList] = None,
+        funding_stages: Optional[StrOrList] = None,
+        functions: Optional[StrOrList] = None,
+        roles: Optional[StrOrList] = None,
+        seniority: Optional[StrOrList] = None,
+        technologies: Optional[StrOrList] = None,
+        skills: Optional[StrOrList] = None,
+        job_countries: Optional[StrOrList] = None,
+        min_strength: Optional[int] = None,
+        detected_after: Optional[str] = None,
+        detected_before: Optional[str] = None,
+        created_after: Optional[str] = None,
+        exclude_agencies: Optional[bool] = None,
+        limit: int = DEFAULT_SIGNAL_LIMIT,
+        cursor: Optional[str] = None,
+    ) -> List[Document]:
+        """Async version of `get_hiring_signals`. Billed per signal returned."""
+        path, params, capped = self._signals_request(**self._args(locals()))
+        try:
+            reply = await self._client.arequest("GET", path, params=params)
+        except JoboAPIError as error:
+            return self._signals_failure(error)
+        return self._signals_documents(reply, capped)
 
 
 def _is_job_not_found(error: JoboNotFoundError) -> bool:

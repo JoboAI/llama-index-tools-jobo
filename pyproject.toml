@@ -26,7 +26,7 @@ dev = [
 
 [project]
 name = "llama-index-tools-jobo"
-version = "0.2.0"
+version = "0.3.0"
 description = "llama-index tools jobo integration: live job listings from employer career sites and ATS platforms"
 authors = [{name = "Jobo", email = "support@jobo.world"}]
 requires-python = ">=3.11,<4.0"
